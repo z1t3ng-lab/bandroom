@@ -40,6 +40,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS bands (
  id INTEGER PRIMARY KEY, name TEXT NOT NULL, timezone TEXT NOT NULL DEFAULT 'America/Toronto', created_at TEXT NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bands_name_unique ON bands(LOWER(name));
 CREATE TABLE IF NOT EXISTS members (
  id INTEGER PRIMARY KEY, band_id INTEGER NOT NULL REFERENCES bands(id) ON DELETE CASCADE,
  display_name TEXT NOT NULL, email TEXT NOT NULL COLLATE NOCASE, password_hash TEXT NOT NULL,
@@ -683,8 +684,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.auth_route(conn, path, body); return
             if path == "/api/status" and method == "GET":
                 with db_connect() as c:
-                    band = c.execute("SELECT name,timezone FROM bands LIMIT 1").fetchone()
-                self.send_json({"configured": bool(band), "band": dict(band) if band else None}); return
+                    configured = bool(c.execute("SELECT 1 FROM bands LIMIT 1").fetchone())
+                self.send_json({"configured": configured}); return
             if path == "/api/logout" and method == "POST":
                 token = self.get_cookie("band_session")
                 if token:
@@ -717,10 +718,10 @@ class Handler(BaseHTTPRequestHandler):
             valid_password(password)
             if not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", email): raise ApiError(400, "Enter a valid email address")
             c = db_connect()
-            c.execute("BEGIN IMMEDIATE")
-            if c.execute("SELECT 1 FROM bands LIMIT 1").fetchone():
-                c.close(); raise ApiError(409, "This band is already set up. Join with an invitation.")
             try:
+                c.execute("BEGIN IMMEDIATE")
+                if c.execute("SELECT 1 FROM bands WHERE lower(name)=lower(?)", (band_name,)).fetchone():
+                    raise ApiError(409, "A band with that name already exists. Choose a different band name.")
                 now = now_iso()
                 band_id = c.execute("INSERT INTO bands(name,timezone,created_at) VALUES(?,?,?)", (band_name, "America/Toronto", now)).lastrowid
                 member_id = c.execute("INSERT INTO members(band_id,display_name,email,password_hash,role,color,created_at) VALUES(?,?,?,?,?,?,?)",
@@ -749,12 +750,14 @@ class Handler(BaseHTTPRequestHandler):
             finally: c.close()
             return
         if path == "/api/login":
+            band_name = clean_text(body.get("band_name"), "Band name", 100, True)
             email = clean_text(body.get("email"), "Email", 254, True).lower()
             password = body.get("password", "")
             c = db_connect()
-            row = c.execute("SELECT * FROM members WHERE email=? AND active=1", (email,)).fetchone()
+            row = c.execute("""SELECT m.* FROM members m JOIN bands b ON b.id=m.band_id
+                WHERE lower(m.email)=lower(?) AND lower(b.name)=lower(?) AND m.active=1""", (email, band_name)).fetchone()
             if not row or not password_ok(password, row["password_hash"]):
-                c.close(); raise ApiError(401, "Email or password is incorrect")
+                c.close(); raise ApiError(401, "Band name, email, or password is incorrect")
             self.create_session(c, row["id"]); c.commit(); c.close()
             return
 

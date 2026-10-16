@@ -84,6 +84,71 @@ class ApiTests(unittest.TestCase):
             self.call(self.member, "/api/invitations", "POST")
         self.assertEqual(forbidden.exception.status, 403)
 
+    def test_multiple_bands_have_separate_signup_and_band_scoped_login(self):
+        status, song = self.call(self.admin, "/api/songs", "POST", body={
+            "title": "First Band Song", "artist": "Aster Avenue"})
+        self.assertEqual(status, 201)
+        self.conn.commit()
+
+        second_signup = self.fake_handler()
+        app.Handler.auth_route(second_signup, None, "/api/signup", {
+            "band_name": "Second Band", "display_name": "Taylor",
+            "email": "avery@example.test", "password": "second-band-password"})
+        self.assertEqual(second_signup.status, 200)
+        self.conn.commit()
+        second_band = self.conn.execute("SELECT * FROM bands WHERE name='Second Band'").fetchone()
+        self.assertIsNotNone(second_band)
+        second_admin_id = self.conn.execute(
+            "SELECT id FROM members WHERE band_id=? AND email=?", (second_band["id"], "avery@example.test")
+        ).fetchone()[0]
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM bands").fetchone()[0], 2)
+
+        login = self.fake_handler()
+        app.Handler.auth_route(login, None, "/api/login", {
+            "band_name": "Second Band", "email": "avery@example.test",
+            "password": "second-band-password"})
+        self.assertEqual(login.status, 200)
+        cookie = SimpleCookie(); cookie.load(login.headers["Set-Cookie"])
+        verified_conn, verified_member, verified_band = app.require_member(
+            FakeHandler(cookie["band_session"].value))
+        try:
+            self.assertEqual(verified_member["id"], second_admin_id)
+            self.assertEqual(verified_band["name"], "Second Band")
+            status, response = self.call(verified_member, "/api/songs")
+            self.assertEqual(status, 200)
+            self.assertEqual(response["songs"], [])
+            self.assertNotIn(song["title"], {item["title"] for item in response["songs"]})
+        finally:
+            verified_conn.close()
+
+        original_login = self.fake_handler()
+        app.Handler.auth_route(original_login, None, "/api/login", {
+            "band_name": "Test Band", "email": "avery@example.test",
+            "password": "test-password-2026"})
+        self.assertEqual(original_login.status, 200)
+        cookie = SimpleCookie(); cookie.load(original_login.headers["Set-Cookie"])
+        original_conn, original_member, original_band = app.require_member(
+            FakeHandler(cookie["band_session"].value))
+        try:
+            self.assertEqual(original_member["id"], self.admin_id)
+            self.assertEqual(original_band["name"], "Test Band")
+        finally:
+            original_conn.close()
+
+        wrong_band_login = self.fake_handler()
+        with self.assertRaises(app.ApiError) as wrong_band:
+            app.Handler.auth_route(wrong_band_login, None, "/api/login", {
+                "band_name": "Test Band", "email": "avery@example.test",
+                "password": "second-band-password"})
+        self.assertEqual(wrong_band.exception.status, 401)
+
+        duplicate_name = self.fake_handler()
+        with self.assertRaises(app.ApiError) as duplicate:
+            app.Handler.auth_route(duplicate_name, None, "/api/signup", {
+                "band_name": "sEcOnD bAnD", "display_name": "Another Taylor",
+                "email": "another@example.test", "password": "another-band-password"})
+        self.assertEqual(duplicate.exception.status, 409)
+
     def test_private_band_scope_isolation(self):
         status, first = self.call(self.admin, "/api/songs", "POST", body={"title":"First Band Song","artist":"Aster Avenue","status":"planned"})
         self.assertEqual(status, 201)

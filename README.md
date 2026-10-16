@@ -10,7 +10,13 @@ Requirements: Python 3.10 or later.
 python3 app.py
 ```
 
-Open [http://127.0.0.1:8000](http://127.0.0.1:8000). The first person to create an account becomes the band admin. The local database is created at `data/band.sqlite3`.
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000). The first person to create a band workspace becomes that band's admin. The local database is created at `data/band.sqlite3`.
+
+## Multiple bands
+
+One Bandroom deployment can host multiple private band workspaces. Choose **Create a band** on the sign-in screen to set up another workspace; band names must be unique on that site. Songs, members, availability, rehearsals, and locations stay scoped to their band. Members join through that band admin's invitation link.
+
+To sign in, enter the exact band name along with the member email and password. Accounts are band-specific; a person who belongs to two bands will have an account in each band.
 
 ## Deploy on Render
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bandroom: a dependency-free, SQLite-backed band management web app."""
+"""Bandroom: a private band management web app with SQLite or hosted Postgres."""
 from __future__ import annotations
 
 import hashlib
@@ -27,6 +27,7 @@ DB_PATH = Path(os.environ.get("BAND_DB", ROOT / "data" / "band.sqlite3")).expand
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8000"))
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "0") == "1"
+BAND_DATABASE_URL = os.environ.get("BAND_DATABASE_URL", "").strip()
 SESSION_DAYS = 14
 STATUSES = {"suggested", "planned", "learning", "practicing", "ready", "archived"}
 ATTENDANCE = {"attending", "maybe", "unavailable", "no_response"}
@@ -151,7 +152,128 @@ def now_iso() -> str:
     return utc_now().isoformat(timespec="seconds")
 
 
-def db_connect() -> sqlite3.Connection:
+class DatabaseRow:
+    """A small row object that supports both row[0] and row['column_name']."""
+
+    def __init__(self, names, values):
+        self._names = list(names)
+        self._values = tuple(values)
+        self._indices = {name: index for index, name in enumerate(self._names)}
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            key = self._indices[key]
+        return self._values[key]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+    def keys(self):
+        return list(self._names)
+
+
+class PostgresCursor:
+    def __init__(self, cursor, inserted_id=None):
+        self._cursor = cursor
+        self._inserted_id = inserted_id
+        self._names = [column.name for column in (cursor.description or ())]
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+    @property
+    def lastrowid(self):
+        return self._inserted_id
+
+    def _row(self, values):
+        return DatabaseRow(self._names, values) if values is not None else None
+
+    def fetchone(self):
+        return self._row(self._cursor.fetchone())
+
+    def fetchall(self):
+        return [self._row(values) for values in self._cursor.fetchall()]
+
+    def __iter__(self):
+        for values in self._cursor:
+            yield self._row(values)
+
+
+class PostgresConnection:
+    """Adapt psycopg to the small subset of sqlite3 used by this app."""
+
+    ID_TABLES = {"bands", "members", "invitations", "songs", "song_comments", "activity",
+                 "availability", "locations", "rehearsals"}
+
+    def __init__(self, connection):
+        self._connection = connection
+
+    @staticmethod
+    def _prepare(sql):
+        sql = sql.strip()
+        if sql.upper() == "BEGIN IMMEDIATE":
+            return "BEGIN", False
+        ignored = bool(re.match(r"(?is)^INSERT\s+OR\s+IGNORE\s+INTO\s+", sql))
+        if ignored:
+            sql = re.sub(r"(?is)^INSERT\s+OR\s+IGNORE\s+INTO\s+", "INSERT INTO ", sql, count=1)
+            sql += " ON CONFLICT DO NOTHING"
+        sql = sql.replace("?", "%s")
+        match = re.match(r"(?is)^INSERT\s+INTO\s+([a-z_]+)", sql)
+        returns_id = bool(match and match.group(1).lower() in PostgresConnection.ID_TABLES
+                          and "RETURNING" not in sql.upper())
+        if returns_id:
+            sql += " RETURNING id"
+        return sql, returns_id
+
+    def execute(self, sql, parameters=()):
+        prepared, returns_id = self._prepare(sql)
+        cursor = self._connection.cursor()
+        cursor.execute(prepared, tuple(parameters or ()))
+        inserted_id = None
+        if returns_id:
+            row = cursor.fetchone()
+            inserted_id = row[0] if row else None
+        return PostgresCursor(cursor, inserted_id)
+
+    def executescript(self, script):
+        # The Bandroom schema contains no semicolons inside SQL string literals.
+        for statement in script.split(";"):
+            if statement.strip():
+                self.execute(statement)
+
+    def commit(self):
+        self._connection.commit()
+
+    def rollback(self):
+        self._connection.rollback()
+
+    def close(self):
+        self._connection.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+        return False
+
+
+def db_connect() -> sqlite3.Connection | PostgresConnection:
+    if BAND_DATABASE_URL:
+        try:
+            import psycopg
+            from psycopg.rows import tuple_row
+        except ImportError as error:
+            raise RuntimeError("BAND_DATABASE_URL is set, but psycopg is not installed") from error
+        connection = psycopg.connect(BAND_DATABASE_URL, sslmode="require", row_factory=tuple_row)
+        return PostgresConnection(connection)
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
@@ -161,9 +283,15 @@ def db_connect() -> sqlite3.Connection:
 
 def init_db() -> None:
     with db_connect() as conn:
-        conn.executescript(SCHEMA)
-        # Small additive migrations keep existing local databases usable.
-        rehearsal_columns={row[1] for row in conn.execute("PRAGMA table_info(rehearsals)")}
+        if BAND_DATABASE_URL:
+            postgres_schema = SCHEMA.replace("PRAGMA foreign_keys = ON;", "").replace(" COLLATE NOCASE", "")
+            postgres_schema = re.sub(r"\bINTEGER PRIMARY KEY\b", "INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY", postgres_schema)
+            conn.executescript(postgres_schema)
+            rehearsal_columns = {row[0] for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='rehearsals'")}
+        else:
+            conn.executescript(SCHEMA)
+            rehearsal_columns={row[1] for row in conn.execute("PRAGMA table_info(rehearsals)")}
         if "event_type" not in rehearsal_columns:
             conn.execute("ALTER TABLE rehearsals ADD COLUMN event_type TEXT NOT NULL DEFAULT 'rehearsal'")
         if "updated_by" not in rehearsal_columns:
@@ -177,10 +305,15 @@ def init_db() -> None:
         if "flat_cost_snapshot" not in rehearsal_columns:
             conn.execute("ALTER TABLE rehearsals ADD COLUMN flat_cost_snapshot REAL")
             conn.execute("UPDATE rehearsals SET flat_cost_snapshot=(SELECT flat_cost FROM locations WHERE locations.id=rehearsals.location_id)")
-        location_columns={row[1] for row in conn.execute("PRAGMA table_info(locations)")}
+        if BAND_DATABASE_URL:
+            location_columns = {row[0] for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='locations'")}
+        else:
+            location_columns={row[1] for row in conn.execute("PRAGMA table_info(locations)")}
         if "version" not in location_columns:
             conn.execute("ALTER TABLE locations ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
-        conn.execute("PRAGMA journal_mode = WAL")
+        if not BAND_DATABASE_URL:
+            conn.execute("PRAGMA journal_mode = WAL")
 
 
 def password_hash(password: str) -> str:
@@ -217,6 +350,18 @@ def parse_json_list(value: str | None) -> list:
 class ApiError(Exception):
     def __init__(self, status: int, message: str, details=None):
         self.status, self.message, self.details = status, message, details
+
+
+def is_database_integrity_error(error: Exception) -> bool:
+    if isinstance(error, sqlite3.IntegrityError):
+        return True
+    if not BAND_DATABASE_URL:
+        return False
+    try:
+        import psycopg
+        return isinstance(error, psycopg.IntegrityError)
+    except ImportError:
+        return False
 
 
 def clean_text(value, name: str, max_length: int = 500, required: bool = False) -> str:
@@ -553,9 +698,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json(ApiError(400, str(error)))
         except (ValueError, ZoneInfoNotFoundError) as error:
             self.send_error_json(ApiError(400, str(error) or "Invalid value"))
-        except sqlite3.IntegrityError as error:
-            self.send_error_json(ApiError(409, "That change conflicts with existing band data"))
         except Exception as error:
+            if is_database_integrity_error(error):
+                self.send_error_json(ApiError(409, "That change conflicts with existing band data"))
+                return
             print(f"Bandroom error: {type(error).__name__}: {error}")
             self.send_error_json(ApiError(500, "Something went wrong. Please try again."))
         finally:

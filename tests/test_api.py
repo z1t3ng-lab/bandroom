@@ -5,6 +5,7 @@ import unittest
 from datetime import date, timedelta
 from http.cookies import SimpleCookie
 from pathlib import Path
+from unittest.mock import patch
 
 import app
 
@@ -37,6 +38,7 @@ class ApiTests(unittest.TestCase):
         self.band = self.conn.execute("SELECT * FROM bands WHERE id=?", (self.band_id,)).fetchone()
         self.admin = self.member_row(self.admin_id)
         self.member = self.member_row(self.member_id)
+        self.conn.commit()
 
     def tearDown(self):
         self.conn.close(); self.temp.cleanup()
@@ -148,6 +150,87 @@ class ApiTests(unittest.TestCase):
                 "band_name": "sEcOnD bAnD", "display_name": "Another Taylor",
                 "email": "another@example.test", "password": "another-band-password"})
         self.assertEqual(duplicate.exception.status, 409)
+
+    def test_password_reset_sends_one_time_link_changes_password_and_revokes_sessions(self):
+        sent = []
+        settings = {"public_url": "https://bandroom.example.test"}
+        with patch.object(app, "password_reset_email_config", return_value=settings), \
+                patch.object(app, "send_password_reset_email", side_effect=lambda *args: sent.append(args)):
+            request = self.fake_handler()
+            app.Handler.password_reset_route(request, "/api/password-reset/request", {
+                "band_name": "Test Band", "email": "member@example.test"})
+        self.assertEqual(request.status, 200)
+        self.assertIn("If that account exists", request.response["message"])
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], "member@example.test")
+        reset_url = sent[0][2]
+        self.assertIn("#reset=", reset_url)
+        token = reset_url.split("#reset=", 1)[1]
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        reset = self.conn.execute("SELECT * FROM password_resets WHERE token_hash=?", (token_hash,)).fetchone()
+        self.assertIsNotNone(reset)
+        self.assertNotIn(token, reset["token_hash"])
+        self.assertGreater(app.datetime.fromisoformat(reset["expires_at"]), app.utc_now())
+
+        session_token = "existing-session-token"
+        self.conn.execute("INSERT INTO sessions(token_hash,member_id,expires_at,created_at) VALUES(?,?,?,?)",
+                          (hashlib.sha256(session_token.encode()).hexdigest(), self.member_id,
+                           (app.utc_now() + timedelta(days=3)).isoformat(timespec="seconds"), app.now_iso()))
+        self.conn.commit()
+        complete = self.fake_handler()
+        app.Handler.password_reset_route(complete, "/api/password-reset/complete", {
+            "token": token, "password": "brand-new-password-2026",
+            "password_confirmation": "brand-new-password-2026"})
+        self.assertEqual(complete.status, 200)
+        member = self.conn.execute("SELECT password_hash FROM members WHERE id=?", (self.member_id,)).fetchone()
+        self.assertTrue(app.password_ok("brand-new-password-2026", member["password_hash"]))
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM sessions WHERE member_id=?", (self.member_id,)).fetchone()[0], 0)
+        used = self.conn.execute("SELECT used_at FROM password_resets WHERE id=?", (reset["id"],)).fetchone()
+        self.assertIsNotNone(used["used_at"])
+        with self.assertRaises(app.ApiError) as replay:
+            app.Handler.password_reset_route(self.fake_handler(), "/api/password-reset/complete", {
+                "token": token, "password": "another-new-password-2026",
+                "password_confirmation": "another-new-password-2026"})
+        self.assertEqual(replay.exception.status, 400)
+
+    def test_password_reset_does_not_disclose_unknown_accounts_and_limits_email(self):
+        sent = []
+        settings = {"public_url": "https://bandroom.example.test"}
+        with patch.object(app, "password_reset_email_config", return_value=settings), \
+                patch.object(app, "send_password_reset_email", side_effect=lambda *args: sent.append(args)):
+            known = self.fake_handler()
+            app.Handler.password_reset_route(known, "/api/password-reset/request", {
+                "band_name": "Test Band", "email": "member@example.test"})
+            unknown = self.fake_handler()
+            app.Handler.password_reset_route(unknown, "/api/password-reset/request", {
+                "band_name": "Test Band", "email": "nobody@example.test"})
+            self.assertEqual(known.response, unknown.response)
+            self.assertEqual(len(sent), 1)
+            for _ in range(2):
+                app.Handler.password_reset_route(self.fake_handler(), "/api/password-reset/request", {
+                    "band_name": "Test Band", "email": "member@example.test"})
+            app.Handler.password_reset_route(self.fake_handler(), "/api/password-reset/request", {
+                "band_name": "Test Band", "email": "member@example.test"})
+        self.assertEqual(len(sent), 3)
+
+    def test_password_reset_rejects_mismatched_and_expired_tokens(self):
+        handler = self.fake_handler()
+        with self.assertRaises(app.ApiError) as mismatch:
+            app.Handler.password_reset_route(handler, "/api/password-reset/complete", {
+                "token": "some-reset-token", "password": "brand-new-password-2026",
+                "password_confirmation": "different-new-password-2026"})
+        self.assertEqual(mismatch.exception.status, 400)
+
+        token = "expired-reset-token"
+        self.conn.execute("INSERT INTO password_resets(member_id,token_hash,expires_at,created_at) VALUES(?,?,?,?)",
+                          (self.member_id, hashlib.sha256(token.encode()).hexdigest(),
+                           (app.utc_now() - timedelta(minutes=1)).isoformat(timespec="seconds"), app.now_iso()))
+        self.conn.commit()
+        with self.assertRaises(app.ApiError) as expired:
+            app.Handler.password_reset_route(self.fake_handler(), "/api/password-reset/complete", {
+                "token": token, "password": "brand-new-password-2026",
+                "password_confirmation": "brand-new-password-2026"})
+        self.assertEqual(expired.exception.status, 400)
 
     def test_private_band_scope_isolation(self):
         status, first = self.call(self.admin, "/api/songs", "POST", body={"title":"First Band Song","artist":"Aster Avenue","status":"planned"})

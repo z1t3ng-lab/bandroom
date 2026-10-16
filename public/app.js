@@ -6,7 +6,7 @@ const ATTENDANCE = {attending:'Attending', maybe:'Maybe', unavailable:'Unavailab
 const COLORS = ['#5c9d8b','#bb795f','#8876ba','#7195bd','#c18f3f','#bd6b84','#629b58','#5d85a2'];
 const app = document.getElementById('app');
 const modal = document.getElementById('modal');
-const state = {member:null,band:null,members:[],allMembers:[],songs:[],dashboard:null,locations:[],rehearsals:[],tab:'songs',practice:'availability',authMode:'login',configured:false,songsQuery:{},weekStart:null,availability:[],overlap:null,searchTimer:null};
+const state = {member:null,band:null,members:[],allMembers:[],songs:[],dashboard:null,locations:[],rehearsals:[],tab:'songs',practice:'availability',authMode:'login',authNotice:'',configured:false,songsQuery:{},weekStart:null,availability:[],overlap:null,searchTimer:null};
 
 function esc(value='') { return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function initials(name='?') { return name.trim().split(/\s+/).slice(0,2).map(p=>p[0]).join('').toUpperCase() || '?'; }
@@ -43,6 +43,8 @@ function showModal(title,subtitle,body) { if(modal.open)modal.close();modal.inne
 function closeModal() { if(modal.open)modal.close();modal.innerHTML=''; }
 
 async function boot() {
+  const resetToken=new URLSearchParams(location.hash.slice(1)).get('reset');
+  if(resetToken){state.authMode='reset';renderAuth({configured:true});return}
   try {
     const session=await api('/api/me');state.member=session.member;state.band=session.band;
     state.weekStart=mondayOf(localDateString());
@@ -65,11 +67,17 @@ async function loadAvailability(){const from=state.weekStart||mondayOf(localDate
 function renderAuth(status={configured:true}) {
   const token=new URLSearchParams(location.search).get('token')||'';
   const mode=state.authMode;
-  const headings={login:['Sign in to your band','Enter your band name, email, and password.'],signup:['Create a band space','Set up a private home for your band’s songs, plans, and practice.'],join:['Join your band','Create your member account to join the shared band space.']};
+  const resetToken=new URLSearchParams(location.hash.slice(1)).get('reset')||'';
+  const headings={login:['Sign in to your band','Enter your band name, email, and password.'],signup:['Create a band space','Set up a private home for your band’s songs, plans, and practice.'],join:['Join your band','Create your member account to join the shared band space.'],forgot:['Reset your password','Enter your band name and account email. We’ll send a one-time reset link if they match.'],reset:['Choose a new password','Set a new password for your Bandroom account. The reset link works once and expires after 30 minutes.']};
   const [title,sub]=headings[mode]||headings.login;
-  const tabs=mode==='join'?'':`<div class="auth-tabs"><button type="button" class="${mode==='login'?'active':''}" data-auth-mode="login">Sign in</button><button type="button" class="${mode==='signup'?'active':''}" data-auth-mode="signup">Create a band</button></div>`;
-  const bandField=mode==='join'?'':`<div class="field full"><label for="band-name">Band name</label><input id="band-name" class="input" name="band_name" required maxlength="100" autocomplete="organization-title" placeholder="${mode==='login'?'Enter your band name':'e.g. The Sunday Set'}"><span class="help">${mode==='login'?'Use the exact name of the band workspace.':'Band names must be unique on this site.'}</span></div>`;
-  app.innerHTML=`<main class="auth-shell"><section class="auth-art"><div class="auth-logo"><span class="brand-mark">♫</span> bandroom</div><div class="auth-message"><span class="eyebrow">A shared space for your sound</span><h1>Good music starts with being in sync.</h1><p>Keep the songs, rehearsal plans, and the people behind them all in one place.</p><div class="soundwaves">${[38,61,30,75,45,90,28,63,39,80,44,66,28,72,52,93,41,75,32,58].map(h=>`<i style="--h:${h}%"></i>`).join('')}</div></div><div style="font-size:11px;color:#a9c0b6">Private to your band · Built for the next practice</div></section><section class="auth-side"><div class="auth-card"><h2>${title}</h2><p class="subtext">${sub}</p>${tabs}<form id="auth-form" data-mode="${mode}" class="form-grid">${bandField}${mode==='join'?`<input type="hidden" name="token" value="${esc(token)}"><div class="field full"><label for="invite-token">Invitation link token</label><input id="invite-token" class="input" name="token_display" value="${esc(token)}" disabled><span class="help">This invitation is private to your band.</span></div>`:''}${mode!=='login'?`<div class="field full"><label for="display-name">Display name</label><input id="display-name" class="input" name="display_name" required maxlength="80" autocomplete="name" placeholder="How the band knows you"></div>`:''}<div class="field full"><label for="email">Email</label><input id="email" class="input" type="email" name="email" required maxlength="254" autocomplete="email" placeholder="you@example.com"></div><div class="field full"><label for="password">Password</label><input id="password" class="input" type="password" name="password" required minlength="10" maxlength="200" autocomplete="${mode==='login'?'current-password':'new-password'}" placeholder="At least 10 characters"><span class="help">Passwords are stored as salted hashes on this server.</span></div><div class="field full"><div id="form-error" class="error-text" hidden></div><button class="btn btn-primary" type="submit">${mode==='login'?'Sign in':mode==='join'?'Join the band':'Create band space'} <span aria-hidden="true">→</span></button></div></form>${mode==='signup'?`<p class="help" style="margin-top:18px">You’ll become the band admin and can invite the rest of the members.</p>`:''}</div></section></main>`;
+  const tabs=['login','signup'].includes(mode)?`<div class="auth-tabs"><button type="button" class="${mode==='login'?'active':''}" data-auth-mode="login">Sign in</button><button type="button" class="${mode==='signup'?'active':''}" data-auth-mode="signup">Create a band</button></div>`:'';
+  const bandField=['login','signup','forgot'].includes(mode)?`<div class="field full"><label for="band-name">Band name</label><input id="band-name" class="input" name="band_name" required maxlength="100" autocomplete="organization-title" placeholder="${mode==='login'?'Enter your band name':'e.g. The Sunday Set'}"><span class="help">${mode==='login'?'Use the exact name of the band workspace.':mode==='forgot'?'Use the band workspace you sign in to.':'Band names must be unique on this site.'}</span></div>`:'';
+  const accountFields=mode==='reset'?`<input type="hidden" name="token" value="${esc(resetToken)}"><div class="field full"><label for="password">New password</label><input id="password" class="input" type="password" name="password" required minlength="10" maxlength="200" autocomplete="new-password" placeholder="At least 10 characters"></div><div class="field full"><label for="password-confirmation">Confirm new password</label><input id="password-confirmation" class="input" type="password" name="password_confirmation" required minlength="10" maxlength="200" autocomplete="new-password" placeholder="Enter it again"></div>`:
+    mode==='forgot'?`<div class="field full"><label for="email">Account email</label><input id="email" class="input" type="email" name="email" required maxlength="254" autocomplete="email" placeholder="you@example.com"></div>`:
+    `${mode==='join'?`<input type="hidden" name="token" value="${esc(token)}"><div class="field full"><label for="invite-token">Invitation link token</label><input id="invite-token" class="input" name="token_display" value="${esc(token)}" disabled><span class="help">This invitation is private to your band.</span></div>`:''}${mode!=='login'?`<div class="field full"><label for="display-name">Display name</label><input id="display-name" class="input" name="display_name" required maxlength="80" autocomplete="name" placeholder="How the band knows you"></div>`:''}<div class="field full"><label for="email">Email</label><input id="email" class="input" type="email" name="email" required maxlength="254" autocomplete="email" placeholder="you@example.com"></div><div class="field full"><label for="password">Password</label><input id="password" class="input" type="password" name="password" required minlength="10" maxlength="200" autocomplete="${mode==='login'?'current-password':'new-password'}" placeholder="At least 10 characters">${mode==='login'?'<span class="help">Your password is stored securely as a salted hash.</span>':''}</div>`;
+  const buttonText={login:'Sign in',signup:'Create band space',join:'Join the band',forgot:'Email me a reset link',reset:'Save new password'}[mode]||'Continue';
+  const extra=mode==='login'?`<button type="button" class="auth-link" data-auth-mode="forgot">Forgot your password?</button>`:['forgot','reset'].includes(mode)?`<button type="button" class="auth-link" data-auth-mode="login">Back to sign in</button>`:mode==='signup'?`<p class="help" style="margin-top:18px">You’ll become the band admin and can invite the rest of the members.</p>`:'';
+  app.innerHTML=`<main class="auth-shell"><section class="auth-art"><div class="auth-logo"><span class="brand-mark">♫</span> bandroom</div><div class="auth-message"><span class="eyebrow">A shared space for your sound</span><h1>Good music starts with being in sync.</h1><p>Keep the songs, rehearsal plans, and the people behind them all in one place.</p><div class="soundwaves">${[38,61,30,75,45,90,28,63,39,80,44,66,28,72,52,93,41,75,32,58].map(h=>`<i style="--h:${h}%"></i>`).join('')}</div></div><div style="font-size:11px;color:#a9c0b6">Private to your band · Built for the next practice</div></section><section class="auth-side"><div class="auth-card"><h2>${title}</h2><p class="subtext">${sub}</p>${tabs}${state.authNotice?`<div class="success-box" role="status">${esc(state.authNotice)}</div>`:''}<form id="auth-form" data-mode="${mode}" class="form-grid">${bandField}${accountFields}<div class="field full"><div id="form-error" class="error-text" hidden></div><button class="btn btn-primary" type="submit">${buttonText} <span aria-hidden="true">→</span></button></div></form>${extra}</div></section></main>`;
 }
 
 function renderShell() {
@@ -203,7 +211,7 @@ async function refreshAll(){await Promise.all([loadMembers(),loadSongs(),loadDas
 function openCurrentPractice(){state.tab='practice';state.practice='rehearsals';renderApp();}
 
 async function handleClick(event){
-  const modeButton=event.target.closest('[data-auth-mode]');if(modeButton){state.authMode=modeButton.dataset.authMode;renderAuth({configured:state.configured});return}
+  const modeButton=event.target.closest('[data-auth-mode]');if(modeButton){state.authMode=modeButton.dataset.authMode;state.authNotice='';if(state.authMode==='login'&&location.hash)history.replaceState({},'',location.pathname);renderAuth({configured:state.configured});return}
   const tab=event.target.closest('[data-tab]');if(tab){state.tab=tab.dataset.tab;renderApp();return}
   const practice=event.target.closest('[data-practice]');if(practice){state.practice=practice.dataset.practice;state.overlap=null;renderApp();return}
   const actionButton=event.target.closest('[data-action]');if(!actionButton)return;
@@ -252,7 +260,16 @@ async function handleSubmit(event){
   event.preventDefault();const fd=new FormData(form);
   try{
     if(form.id==='auth-form'){
-      const mode=form.dataset.mode;const body={email:formValue(fd,'email'),password:fd.get('password')};if(mode!=='join')body.band_name=formValue(fd,'band_name');if(mode!=='login')body.display_name=formValue(fd,'display_name');if(mode==='join')body.token=fd.get('token');
+      const mode=form.dataset.mode;
+      if(mode==='forgot'){
+        await api('/api/password-reset/request',{method:'POST',body:{band_name:formValue(fd,'band_name'),email:formValue(fd,'email')}});
+        state.authNotice='If the account matches this band and email, a reset link will arrive shortly. Check your inbox and spam folder.';renderAuth({configured:true});return;
+      }
+      if(mode==='reset'){
+        await api('/api/password-reset/complete',{method:'POST',body:{token:fd.get('token'),password:fd.get('password'),password_confirmation:fd.get('password_confirmation')}});
+        history.replaceState({},'',location.pathname);state.authMode='login';state.authNotice='Your password has been reset. Sign in with your new password.';renderAuth({configured:true});return;
+      }
+      const body={email:formValue(fd,'email'),password:fd.get('password')};if(mode!=='join')body.band_name=formValue(fd,'band_name');if(mode!=='login')body.display_name=formValue(fd,'display_name');if(mode==='join')body.token=fd.get('token');
       const route=mode==='login'?'/api/login':mode==='signup'?'/api/signup':'/api/join';await api(route,{method:'POST',body});const session=await api('/api/me');state.member=session.member;state.band=session.band;state.configured=true;state.weekStart=mondayOf(localDateString());await loadMembers();await loadSongs();await loadDashboard();history.replaceState({},'',location.pathname);renderApp();return;
     }
     if(form.id==='song-form'){
@@ -280,7 +297,7 @@ async function handleSubmit(event){
     }
     if(form.id==='profile-form') {const body={display_name:formValue(fd,'display_name'),roles:[...form.querySelectorAll('input[name="roles"]:checked')].map(i=>i.value),color:formValue(fd,'color')};const result=await api('/api/me',{method:'PATCH',body});state.member=result.member;await loadMembers();toast('Profile updated');closeModal();renderApp();return}
     if(form.id==='member-admin-form'){const target=Number(formValue(fd,'target_id'));const body={display_name:formValue(fd,'display_name'),role:formValue(fd,'role'),active:fd.has('active'),roles:[...form.querySelectorAll('input[name="roles"]:checked')].map(i=>i.value)};await api(`/api/members/${target}`,{method:'PATCH',body});await loadMembers();await loadAllMembers();state.member=state.members.find(m=>m.id===state.member.id)||state.member;toast('Member updated');manageMembersForm(target);return}
-  }catch(error){if(error.status===409&&error.details){setFormError(error.message,error.details)}else if(modal.open&&modal.querySelector('#form-error'))setFormError(error.message);else toast(error.message,true)}
+  }catch(error){if(form.id==='auth-form'){const box=form.querySelector('#form-error');if(box){box.textContent=error.message;box.hidden=false}}else if(error.status===409&&error.details){setFormError(error.message,error.details)}else if(modal.open&&modal.querySelector('#form-error'))setFormError(error.message);else toast(error.message,true)}
 }
 
 app.addEventListener('click',handleClick);

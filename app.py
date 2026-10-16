@@ -8,10 +8,14 @@ import json
 import os
 import re
 import secrets
+import smtplib
+import ssl
 import sqlite3
 import time as time_module
 import colorsys
 from datetime import date, datetime, time, timedelta, timezone
+from email.message import EmailMessage
+from email.utils import formataddr
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -52,6 +56,11 @@ CREATE TABLE IF NOT EXISTS sessions (
  token_hash TEXT PRIMARY KEY, member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
  expires_at TEXT NOT NULL, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS password_resets (
+ id INTEGER PRIMARY KEY, member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+ token_hash TEXT NOT NULL UNIQUE, expires_at TEXT NOT NULL, used_at TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_password_resets_member_created ON password_resets(member_id,created_at);
 CREATE TABLE IF NOT EXISTS invitations (
  id INTEGER PRIMARY KEY, band_id INTEGER NOT NULL REFERENCES bands(id) ON DELETE CASCADE,
  token_hash TEXT NOT NULL UNIQUE, created_by INTEGER NOT NULL REFERENCES members(id),
@@ -207,7 +216,7 @@ class PostgresCursor:
 class PostgresConnection:
     """Adapt psycopg to the small subset of sqlite3 used by this app."""
 
-    ID_TABLES = {"bands", "members", "invitations", "songs", "song_comments", "activity",
+    ID_TABLES = {"bands", "members", "invitations", "password_resets", "songs", "song_comments", "activity",
                  "availability", "locations", "rehearsals"}
 
     def __init__(self, connection):
@@ -338,6 +347,56 @@ def password_ok(password: str, encoded: str) -> bool:
 def valid_password(password: str) -> None:
     if not isinstance(password, str) or len(password) < 10 or len(password) > 200:
         raise ApiError(400, "Password must be between 10 and 200 characters")
+
+
+def password_reset_email_config() -> dict:
+    """Read and validate the mail settings needed for account recovery."""
+    settings = {
+        "host": os.environ.get("SMTP_HOST", "").strip(),
+        "username": os.environ.get("SMTP_USERNAME", "").strip(),
+        "password": os.environ.get("SMTP_PASSWORD", ""),
+        "from_email": os.environ.get("SMTP_FROM_EMAIL", "").strip(),
+        "from_name": os.environ.get("SMTP_FROM_NAME", "Bandroom").strip() or "Bandroom",
+        "public_url": os.environ.get("BANDROOM_PUBLIC_URL", "").strip().rstrip("/"),
+    }
+    try:
+        settings["port"] = int(os.environ.get("SMTP_PORT", "587"))
+    except ValueError as error:
+        raise ApiError(503, "Password reset email is not configured yet. Please contact the site admin.") from error
+    if (not all(settings[key] for key in ("host", "username", "password", "from_email", "public_url"))
+            or not 1 <= settings["port"] <= 65535
+            or not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", settings["from_email"])):
+        raise ApiError(503, "Password reset email is not configured yet. Please contact the site admin.")
+    public = urlparse(settings["public_url"])
+    local_http = public.scheme == "http" and public.hostname in {"localhost", "127.0.0.1", "::1"}
+    if not public.hostname or (public.scheme != "https" and not local_http) or public.username or public.password:
+        raise ApiError(503, "Password reset email is not configured yet. Please contact the site admin.")
+    return settings
+
+
+def send_password_reset_email(recipient: str, band_name: str, reset_url: str, settings: dict) -> None:
+    message = EmailMessage()
+    message["Subject"] = "Reset your Bandroom password"
+    message["From"] = formataddr((settings["from_name"], settings["from_email"]))
+    message["To"] = recipient
+    message.set_content(
+        f"A password reset was requested for your {band_name} Bandroom account.\n\n"
+        f"Choose a new password using this one-time link (it expires in 30 minutes):\n{reset_url}\n\n"
+        "If you did not request this, you can ignore this email. Your password will not change."
+    )
+    timeout = 15
+    if settings["port"] == 465:
+        with smtplib.SMTP_SSL(settings["host"], settings["port"],
+                              context=ssl.create_default_context(), timeout=timeout) as server:
+            server.login(settings["username"], settings["password"])
+            server.send_message(message)
+    else:
+        with smtplib.SMTP(settings["host"], settings["port"], timeout=timeout) as server:
+            server.ehlo()
+            server.starttls(context=ssl.create_default_context())
+            server.ehlo()
+            server.login(settings["username"], settings["password"])
+            server.send_message(message)
 
 
 def parse_json_list(value: str | None) -> list:
@@ -682,6 +741,8 @@ class Handler(BaseHTTPRequestHandler):
             body = self.body() if method in ("POST", "PATCH", "DELETE") else {}
             if path in ("/api/login", "/api/signup", "/api/join") and method == "POST":
                 self.auth_route(conn, path, body); return
+            if path in ("/api/password-reset/request", "/api/password-reset/complete") and method == "POST":
+                self.password_reset_route(path, body); return
             if path == "/api/status" and method == "GET":
                 with db_connect() as c:
                     configured = bool(c.execute("SELECT 1 FROM bands LIMIT 1").fetchone())
@@ -760,6 +821,96 @@ class Handler(BaseHTTPRequestHandler):
                 c.close(); raise ApiError(401, "Band name, email, or password is incorrect")
             self.create_session(c, row["id"]); c.commit(); c.close()
             return
+
+    def password_reset_route(self, path, body):
+        generic_response = {"message": "If that account exists, a password reset link will arrive shortly."}
+        if path == "/api/password-reset/request":
+            settings = password_reset_email_config()
+            band_name = clean_text(body.get("band_name"), "Band name", 100, True)
+            email = clean_text(body.get("email"), "Email", 254, True).lower()
+            if not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", email):
+                raise ApiError(400, "Enter a valid email address")
+
+            now = utc_now()
+            now_text = now.isoformat(timespec="seconds")
+            cutoff = (now - timedelta(hours=1)).isoformat(timespec="seconds")
+            token = secrets.token_urlsafe(32)
+            token_hash = hashlib.sha256(token.encode()).hexdigest()
+            reset_id = None
+            recipient = None
+            found_band_name = None
+            conn = db_connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                member = conn.execute("""SELECT m.id,m.email,b.name AS band_name FROM members m
+                    JOIN bands b ON b.id=m.band_id
+                    WHERE lower(m.email)=lower(?) AND lower(b.name)=lower(?) AND m.active=1""",
+                    (email, band_name)).fetchone()
+                if member:
+                    sent_recently = conn.execute("""SELECT COUNT(*) FROM password_resets
+                        WHERE member_id=? AND created_at>=?""", (member["id"], cutoff)).fetchone()[0]
+                    if sent_recently < 3:
+                        # Keep recent rows for rate limiting, but discard old history.
+                        conn.execute("DELETE FROM password_resets WHERE member_id=? AND created_at<?",
+                                     (member["id"], (now - timedelta(days=2)).isoformat(timespec="seconds")))
+                        expires = (now + timedelta(minutes=30)).isoformat(timespec="seconds")
+                        reset_id = conn.execute("""INSERT INTO password_resets(member_id,token_hash,expires_at,created_at)
+                            VALUES(?,?,?,?)""", (member["id"], token_hash, expires, now_text)).lastrowid
+                        recipient, found_band_name = member["email"], member["band_name"]
+                conn.commit()
+            finally:
+                conn.close()
+
+            if reset_id is not None:
+                # A URL fragment is not sent to the web server or included in its access logs.
+                reset_url = f"{settings['public_url']}/#reset={token}"
+                try:
+                    send_password_reset_email(recipient, found_band_name, reset_url, settings)
+                except Exception as error:
+                    cleanup = db_connect()
+                    try:
+                        cleanup.execute("DELETE FROM password_resets WHERE id=? AND token_hash=?",
+                                        (reset_id, token_hash))
+                        cleanup.commit()
+                    finally:
+                        cleanup.close()
+                    print(f"Bandroom password reset email delivery failed: {type(error).__name__}")
+                    raise ApiError(503, "We could not send the reset email. Please try again later or contact the site admin.") from error
+            self.send_json(generic_response)
+            return
+
+        token = clean_text(body.get("token"), "Reset link", 200, True)
+        password = body.get("password", "")
+        confirmation = body.get("password_confirmation", "")
+        valid_password(password)
+        if not isinstance(confirmation, str) or not hmac.compare_digest(password, confirmation):
+            raise ApiError(400, "The new passwords do not match")
+
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        now_text = now_iso()
+        conn = db_connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            reset = conn.execute("""SELECT r.id,r.member_id FROM password_resets r
+                JOIN members m ON m.id=r.member_id
+                WHERE r.token_hash=? AND r.used_at IS NULL AND r.expires_at>? AND m.active=1""",
+                (token_hash, now_text)).fetchone()
+            if not reset:
+                raise ApiError(400, "This reset link is invalid or has expired. Request a new one.")
+            changed = conn.execute("""UPDATE password_resets SET used_at=?
+                WHERE id=? AND used_at IS NULL AND expires_at>?""",
+                (now_text, reset["id"], now_text))
+            if changed.rowcount != 1:
+                raise ApiError(400, "This reset link is invalid or has expired. Request a new one.")
+            conn.execute("UPDATE members SET password_hash=? WHERE id=?",
+                         (password_hash(password), reset["member_id"]))
+            conn.execute("DELETE FROM sessions WHERE member_id=?", (reset["member_id"],))
+            conn.execute("DELETE FROM password_resets WHERE member_id=? AND id<>?",
+                         (reset["member_id"], reset["id"]))
+            conn.commit()
+        finally:
+            conn.close()
+        self.send_json({"ok": True})
 
     def create_session(self, conn, member_id):
         token = secrets.token_urlsafe(32)

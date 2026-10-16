@@ -18,9 +18,27 @@ One Bandroom deployment can host multiple private band workspaces. Choose **Crea
 
 To sign in, enter the exact band name along with the member email and password. Accounts are band-specific; a person who belongs to two bands will have an account in each band.
 
+## Password reset email
+
+Sign-in includes a **Forgot your password?** link. The member enters their band name and account email. If they match an active account, Bandroom emails a one-time link that expires after 30 minutes. The member chooses a new password on the site. The link is stored as a hash, can only be used once, and resetting the password signs out that member's existing sessions.
+
+Password reset requires an SMTP email provider. Add these environment variables to the server (for example, in Render's service **Environment** settings):
+
+| Variable | Value |
+| --- | --- |
+| `BANDROOM_PUBLIC_URL` | The public HTTPS address of the app, such as `https://bandroom.onrender.com` |
+| `SMTP_HOST` | The SMTP hostname supplied by your email provider |
+| `SMTP_PORT` | Usually `587` for STARTTLS, or `465` for TLS |
+| `SMTP_USERNAME` | SMTP username from the provider |
+| `SMTP_PASSWORD` | SMTP password or provider-generated API credential; keep it secret |
+| `SMTP_FROM_EMAIL` | Sender address approved by your provider |
+| `SMTP_FROM_NAME` | Optional display name; defaults to `Bandroom` |
+
+Use an email delivery provider that permits transactional password-reset messages, and follow its instructions to verify the sender address. These settings are optional for local use, but password reset will show a setup message until all required values are configured. Never put real SMTP credentials in GitHub, `.env.example`, or a message. After changing Render environment settings, redeploy the service.
+
 ## Deploy on Render
 
-Render Free web services have a temporary filesystem, so use a hosted PostgreSQL database for real band data. Create a database, then add its private connection string in Render as `BAND_DATABASE_URL`. Do not commit or share the connection string. Set `COOKIE_SECURE=1` in Render.
+Render Free web services have a temporary filesystem, so use a hosted PostgreSQL database for real band data. Create a database, then add its private connection string in Render as `BAND_DATABASE_URL`. Do not commit or share the connection string. Set `COOKIE_SECURE=1` in Render. To enable password resets, also add the SMTP variables above, using your real Render URL for `BANDROOM_PUBLIC_URL`.
 
 Use these Render commands:
 

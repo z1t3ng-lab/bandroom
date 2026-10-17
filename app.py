@@ -92,6 +92,12 @@ CREATE TABLE IF NOT EXISTS activity (
  member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
  action TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id INTEGER NOT NULL, entity_title TEXT NOT NULL, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS announcements (
+ id INTEGER PRIMARY KEY, band_id INTEGER NOT NULL REFERENCES bands(id) ON DELETE CASCADE,
+ member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+ body TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_announcements_band_created ON announcements(band_id,created_at DESC,id DESC);
 CREATE TABLE IF NOT EXISTS availability (
  id INTEGER PRIMARY KEY, band_id INTEGER NOT NULL REFERENCES bands(id) ON DELETE CASCADE,
  member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
@@ -216,7 +222,7 @@ class PostgresCursor:
 class PostgresConnection:
     """Adapt psycopg to the small subset of sqlite3 used by this app."""
 
-    ID_TABLES = {"bands", "members", "invitations", "password_resets", "songs", "song_comments", "activity",
+    ID_TABLES = {"bands", "members", "invitations", "password_resets", "songs", "song_comments", "activity", "announcements",
                  "availability", "locations", "rehearsals"}
 
     def __init__(self, connection):
@@ -984,6 +990,20 @@ class Handler(BaseHTTPRequestHandler):
             conn.commit();self.send_json({"invite_url": f"/join?token={token}", "expires_at": expires.isoformat(timespec="seconds")}, 201); return
         if path == "/api/dashboard" and method == "GET":
             self.dashboard(conn, member, band); return
+        if path == "/api/announcements" and method == "POST":
+            announcement = clean_text(body.get("body"), "Announcement", 2000, True)
+            created_at = now_iso()
+            announcement_id = conn.execute(
+                "INSERT INTO announcements(band_id,member_id,body,created_at) VALUES(?,?,?,?)",
+                (bid, mid, announcement, created_at),
+            ).lastrowid
+            record_activity(conn, bid, mid, "posted an announcement", "announcement", announcement_id,
+                            announcement[:120])
+            conn.commit()
+            saved = conn.execute("""SELECT a.id,a.body,a.created_at,m.id AS member_id,m.display_name,m.color
+                FROM announcements a JOIN members m ON m.id=a.member_id
+                WHERE a.id=? AND a.band_id=?""", (announcement_id, bid)).fetchone()
+            self.send_json(dict(saved), 201); return
         if path == "/api/songs" and method == "GET":
             self.list_songs(conn, member, query); return
         if path == "/api/songs" and method == "POST":
@@ -1155,7 +1175,11 @@ class Handler(BaseHTTPRequestHandler):
             FROM songs s JOIN members m ON m.id=s.updated_by WHERE s.band_id=? AND s.status IN ('learning','practicing') ORDER BY s.priority DESC,s.updated_at DESC LIMIT 5""",(mid,bid))]
         updates=[dict(r) for r in conn.execute("""SELECT a.id,a.action,a.entity_type,a.entity_title,a.created_at,m.display_name,m.color FROM activity a
             JOIN members m ON m.id=a.member_id WHERE a.band_id=? ORDER BY a.created_at DESC,a.id DESC LIMIT 8""",(bid,))]
+        announcements=[dict(r) for r in conn.execute("""SELECT a.id,a.body,a.created_at,m.id AS member_id,m.display_name,m.color
+            FROM announcements a JOIN members m ON m.id=a.member_id WHERE a.band_id=?
+            ORDER BY a.created_at DESC,a.id DESC LIMIT 10""",(bid,))]
         self.send_json({"next_rehearsal":next_rehearsal,"planned_songs":songs,"needs_practice":practice,"recent_updates":updates,
+                        "announcements":announcements,
                         "songs_count":conn.execute("SELECT COUNT(*) FROM songs WHERE band_id=? AND status!='archived'",(bid,)).fetchone()[0],
                         "member_count":conn.execute("SELECT COUNT(*) FROM members WHERE band_id=? AND active=1",(bid,)).fetchone()[0]})
 

@@ -247,6 +247,33 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(titles,{"Other Band Only"})
         self.assertNotIn(first["title"],titles)
 
+    def test_announcements_are_persistent_member_authored_and_band_private(self):
+        status, created = self.call(self.member, "/api/announcements", "POST", body={"body": "Rehearsal moved to Friday."})
+        self.assertEqual(status, 201)
+        self.assertEqual(created["body"], "Rehearsal moved to Friday.")
+        self.assertEqual(created["display_name"], "Morgan")
+
+        status, dashboard = self.call(self.admin, "/api/dashboard")
+        self.assertEqual(status, 200)
+        self.assertEqual(dashboard["announcements"][0]["id"], created["id"])
+        self.assertEqual(dashboard["announcements"][0]["body"], "Rehearsal moved to Friday.")
+        self.assertEqual(dashboard["announcements"][0]["member_id"], self.member_id)
+
+        now = app.now_iso()
+        other_band = self.conn.execute("INSERT INTO bands(name,timezone,created_at) VALUES(?,?,?)",
+                                       ("Announcement Test Band", "America/Toronto", now)).lastrowid
+        other_member_id = self.add_member("Taylor", "taylor@announcements.test", "admin", other_band)
+        status, other_dashboard = self.call(self.member_row(other_member_id), "/api/dashboard")
+        self.assertEqual(status, 200)
+        self.assertEqual(other_dashboard["announcements"], [])
+
+        with self.assertRaises(app.ApiError) as empty:
+            self.call(self.admin, "/api/announcements", "POST", body={"body": "  "})
+        self.assertEqual(empty.exception.status, 400)
+        with self.assertRaises(app.ApiError) as too_long:
+            self.call(self.admin, "/api/announcements", "POST", body={"body": "x" * 2001})
+        self.assertEqual(too_long.exception.status, 400)
+
     def test_song_create_edit_and_stale_edit_conflict(self):
         status,song=self.call(self.admin,"/api/songs","POST",body={"title":"Glass Harbour","artist":"The Lumen Lines","status":"learning","priority":4})
         self.assertEqual(status,201,song)

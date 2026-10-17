@@ -53,6 +53,13 @@ class PostgresCompatibilityTests(unittest.TestCase):
         self.assertEqual(result.lastrowid, 27)
         self.assertEqual(cursor.executed, ("INSERT INTO songs(title) VALUES(%s) RETURNING id", ("New song",)))
 
+        announcement_cursor = FakeCursor(rows=[(28,)], description=["id"])
+        announcement_connection = app.PostgresConnection(FakeConnection(announcement_cursor))
+        result = announcement_connection.execute("INSERT INTO announcements(body) VALUES(?)", ("Practice moved",))
+        self.assertEqual(result.lastrowid, 28)
+        self.assertEqual(announcement_cursor.executed,
+                         ("INSERT INTO announcements(body) VALUES(%s) RETURNING id", ("Practice moved",)))
+
         result_cursor = FakeCursor(rows=[(3, "Song", "Artist")], description=["id", "title", "artist"])
         result = app.PostgresCursor(result_cursor)
         row = result.fetchone()

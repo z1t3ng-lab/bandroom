@@ -11,6 +11,7 @@ import secrets
 import smtplib
 import ssl
 import sqlite3
+import threading
 import time as time_module
 import colorsys
 from datetime import date, datetime, time, timedelta, timezone
@@ -95,7 +96,8 @@ CREATE TABLE IF NOT EXISTS activity (
 CREATE TABLE IF NOT EXISTS announcements (
  id INTEGER PRIMARY KEY, band_id INTEGER NOT NULL REFERENCES bands(id) ON DELETE CASCADE,
  member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
- body TEXT NOT NULL, created_at TEXT NOT NULL
+ body TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT '',
+ is_pinned INTEGER NOT NULL DEFAULT 0, version INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_announcements_band_created ON announcements(band_id,created_at DESC,id DESC);
 CREATE TABLE IF NOT EXISTS availability (
@@ -153,6 +155,17 @@ CREATE TABLE IF NOT EXISTS cost_shares (
  amount_cents INTEGER NOT NULL DEFAULT 0, reimbursement_paid INTEGER NOT NULL DEFAULT 0,
  PRIMARY KEY(rehearsal_id,member_id)
 );
+CREATE TABLE IF NOT EXISTS email_notifications (
+ id INTEGER PRIMARY KEY, band_id INTEGER NOT NULL REFERENCES bands(id) ON DELETE CASCADE,
+ rehearsal_id INTEGER NOT NULL REFERENCES rehearsals(id) ON DELETE CASCADE,
+ member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+ kind TEXT NOT NULL CHECK(kind IN ('invite','change','reminder')),
+ event_key TEXT NOT NULL UNIQUE, send_at TEXT NOT NULL,
+ status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sending','sent','cancelled')),
+ attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', locked_at TEXT,
+ created_at TEXT NOT NULL, sent_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_email_notifications_due ON email_notifications(status,send_at);
 CREATE INDEX IF NOT EXISTS idx_songs_band ON songs(band_id);
 CREATE INDEX IF NOT EXISTS idx_activity_band ON activity(band_id,created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_rehearsals_start ON rehearsals(band_id,start_utc);
@@ -308,6 +321,18 @@ def init_db() -> None:
         else:
             conn.executescript(SCHEMA)
             rehearsal_columns={row[1] for row in conn.execute("PRAGMA table_info(rehearsals)")}
+        if BAND_DATABASE_URL:
+            announcement_columns = {row[0] for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='announcements'")}
+        else:
+            announcement_columns = {row[1] for row in conn.execute("PRAGMA table_info(announcements)")}
+        if "updated_at" not in announcement_columns:
+            conn.execute("ALTER TABLE announcements ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+        if "is_pinned" not in announcement_columns:
+            conn.execute("ALTER TABLE announcements ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0")
+        if "version" not in announcement_columns:
+            conn.execute("ALTER TABLE announcements ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+        conn.execute("UPDATE announcements SET updated_at=created_at WHERE updated_at=''")
         if "event_type" not in rehearsal_columns:
             conn.execute("ALTER TABLE rehearsals ADD COLUMN event_type TEXT NOT NULL DEFAULT 'rehearsal'")
         if "updated_by" not in rehearsal_columns:
@@ -329,6 +354,7 @@ def init_db() -> None:
         if "version" not in location_columns:
             conn.execute("ALTER TABLE locations ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
         if not BAND_DATABASE_URL:
+            conn.commit()
             conn.execute("PRAGMA journal_mode = WAL")
 
 
@@ -390,6 +416,10 @@ def send_password_reset_email(recipient: str, band_name: str, reset_url: str, se
         f"Choose a new password using this one-time link (it expires in 30 minutes):\n{reset_url}\n\n"
         "If you did not request this, you can ignore this email. Your password will not change."
     )
+    send_smtp_message(message, settings)
+
+
+def send_smtp_message(message: EmailMessage, settings: dict) -> None:
     timeout = 15
     if settings["port"] == 465:
         with smtplib.SMTP_SSL(settings["host"], settings["port"],
@@ -403,6 +433,165 @@ def send_password_reset_email(recipient: str, band_name: str, reset_url: str, se
             server.ehlo()
             server.login(settings["username"], settings["password"])
             server.send_message(message)
+
+
+def send_rehearsal_email(notification, settings: dict) -> None:
+    rehearsal_start = datetime.fromisoformat(notification["start_utc"]).astimezone(ZoneInfo(notification["timezone"]))
+    rehearsal_end = datetime.fromisoformat(notification["end_utc"]).astimezone(ZoneInfo(notification["timezone"]))
+    when = f"{rehearsal_start.strftime('%A, %B %d, %Y').replace(' 0', ' ')} · {rehearsal_start.strftime('%I:%M %p').lstrip('0')}–{rehearsal_end.strftime('%I:%M %p').lstrip('0')} {rehearsal_start.strftime('%Z')}"
+    if notification["kind"] == "reminder":
+        subject = "Bandroom rehearsal reminder"
+        lead = "A reminder about your upcoming band rehearsal."
+    elif notification["kind"] == "change":
+        subject = "Bandroom rehearsal updated"
+        lead = "The details for this band rehearsal have changed."
+    else:
+        subject = "Bandroom rehearsal invitation"
+        lead = "You have been invited to a band rehearsal. Please sign in to respond."
+    location = notification["location_name_snapshot"] or "Location to be decided"
+    if notification["address_snapshot"]:
+        location += f"\n{notification['address_snapshot']}"
+    if notification["room_number"]:
+        location += f" · Room {notification['room_number']}"
+    if notification["booking_link"]:
+        location += f"\nBooking: {notification['booking_link']}"
+    app_url = settings["public_url"]
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = formataddr((settings["from_name"], settings["from_email"]))
+    message["To"] = notification["email"]
+    message.set_content(
+        f"Hi {notification['display_name']},\n\n{lead}\n\n"
+        f"{notification['title']} · {notification['rehearsal_status'].title()}\n"
+        f"{when} ({notification['timezone']})\n{location}\n\n"
+        f"Open Bandroom to see the full plan and update your response: {app_url}\n"
+        f"Band: {notification['band_name']}\n"
+    )
+    send_smtp_message(message, settings)
+
+
+def queue_rehearsal_email(conn, band_id: int, rehearsal_id: int, member_id: int, kind: str,
+                          send_at: datetime, event_key: str) -> None:
+    conn.execute("""INSERT OR IGNORE INTO email_notifications
+        (band_id,rehearsal_id,member_id,kind,event_key,send_at,created_at)
+        VALUES(?,?,?,?,?,?,?)""",
+        (band_id, rehearsal_id, member_id, kind, event_key,
+         send_at.astimezone(timezone.utc).isoformat(timespec="seconds"), now_iso()))
+
+
+def queue_rehearsal_invites(conn, band_id: int, rehearsal_id: int, member_ids: list[int], version: int,
+                            kind: str = "invite") -> None:
+    now = utc_now()
+    for member_id in member_ids:
+        queue_rehearsal_email(conn, band_id, rehearsal_id, member_id, kind, now,
+                              f"{kind}:{rehearsal_id}:{member_id}:v{version}")
+
+
+def refresh_rehearsal_reminders(conn, band_id: int, rehearsal_id: int, member_ids: list[int],
+                                start_utc: str, status: str, version: int) -> None:
+    conn.execute("UPDATE email_notifications SET status='cancelled',locked_at=NULL WHERE rehearsal_id=? AND kind='reminder' AND status='pending'",
+                 (rehearsal_id,))
+    if status not in ("proposed", "confirmed"):
+        return
+    send_at = datetime.fromisoformat(start_utc).astimezone(timezone.utc) - timedelta(hours=24)
+    if send_at <= utc_now():
+        return
+    pending = {row[0] for row in conn.execute(
+        "SELECT member_id FROM rehearsal_attendance WHERE rehearsal_id=? AND response='no_response'",
+        (rehearsal_id,))}
+    for member_id in member_ids:
+        if member_id in pending:
+            queue_rehearsal_email(conn, band_id, rehearsal_id, member_id, "reminder", send_at,
+                                  f"reminder:{rehearsal_id}:{member_id}:v{version}")
+
+
+def process_email_notification(notification_id: int, now: datetime | None = None) -> bool:
+    now_text = (now or utc_now()).astimezone(timezone.utc).isoformat(timespec="seconds")
+    conn = db_connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        notification = conn.execute("""SELECT q.id,q.band_id,q.rehearsal_id,q.member_id,q.kind,q.attempts,
+                m.email,m.display_name,m.active,b.name AS band_name,
+                r.title,r.start_utc,r.end_utc,r.timezone,r.status AS rehearsal_status,r.location_name_snapshot,
+                r.address_snapshot,r.room_number,r.booking_link,a.response
+            FROM email_notifications q JOIN members m ON m.id=q.member_id
+            JOIN bands b ON b.id=q.band_id JOIN rehearsals r ON r.id=q.rehearsal_id
+            LEFT JOIN rehearsal_attendance a ON a.rehearsal_id=q.rehearsal_id AND a.member_id=q.member_id
+            WHERE q.id=? AND q.status='pending' AND q.send_at<=?""", (notification_id, now_text)).fetchone()
+        if not notification:
+            conn.commit()
+            return False
+        claimed = conn.execute("UPDATE email_notifications SET status='sending',locked_at=? WHERE id=? AND status='pending'",
+                               (now_text, notification_id))
+        if claimed.rowcount != 1:
+            conn.rollback()
+            return False
+        conn.commit()
+    finally:
+        conn.close()
+
+    if (not notification["active"] or notification["response"] is None
+            or notification["kind"] == "reminder" and notification["response"] != "no_response"
+            or notification["kind"] in ("invite", "reminder") and notification["rehearsal_status"] not in ("proposed", "confirmed")):
+        conn = db_connect()
+        try:
+            conn.execute("UPDATE email_notifications SET status='cancelled',locked_at=NULL WHERE id=? AND status='sending'", (notification_id,))
+            conn.commit()
+        finally:
+            conn.close()
+        return False
+
+    try:
+        settings = password_reset_email_config()
+        send_rehearsal_email(notification, settings)
+    except Exception as error:
+        attempts = int(notification["attempts"]) + 1
+        delay_seconds = min(3600, 60 * (2 ** min(attempts - 1, 6)))
+        retry_at = (now or utc_now()) + timedelta(seconds=delay_seconds)
+        conn = db_connect()
+        try:
+            conn.execute("""UPDATE email_notifications SET status='pending',attempts=?,last_error=?,send_at=?,locked_at=NULL
+                WHERE id=? AND status='sending'""",
+                (attempts, type(error).__name__, retry_at.astimezone(timezone.utc).isoformat(timespec="seconds"), notification_id))
+            conn.commit()
+        finally:
+            conn.close()
+        print(f"Bandroom rehearsal email delivery failed: {type(error).__name__}")
+        return False
+
+    conn = db_connect()
+    try:
+        conn.execute("UPDATE email_notifications SET status='sent',sent_at=?,locked_at=NULL,last_error='' WHERE id=? AND status='sending'",
+                     (now_text, notification_id))
+        conn.commit()
+    finally:
+        conn.close()
+    return True
+
+
+def process_due_email_notifications(limit: int = 25) -> int:
+    now_text = now_iso()
+    conn = db_connect()
+    try:
+        stale_lock = (utc_now() - timedelta(minutes=5)).isoformat(timespec="seconds")
+        conn.execute("UPDATE email_notifications SET status='pending',locked_at=NULL WHERE status='sending' AND locked_at<?",
+                     (stale_lock,))
+        due_ids = [row[0] for row in conn.execute(
+            "SELECT id FROM email_notifications WHERE status='pending' AND send_at<=? ORDER BY send_at,id LIMIT ?",
+            (now_text, limit))]
+        conn.commit()
+    finally:
+        conn.close()
+    return sum(1 for notification_id in due_ids if process_email_notification(notification_id))
+
+
+def email_worker() -> None:
+    while True:
+        try:
+            process_due_email_notifications()
+        except Exception as error:
+            print(f"Bandroom email worker failed: {type(error).__name__}")
+        time_module.sleep(30)
 
 
 def parse_json_list(value: str | None) -> list:
@@ -994,16 +1183,86 @@ class Handler(BaseHTTPRequestHandler):
             announcement = clean_text(body.get("body"), "Announcement", 2000, True)
             created_at = now_iso()
             announcement_id = conn.execute(
-                "INSERT INTO announcements(band_id,member_id,body,created_at) VALUES(?,?,?,?)",
-                (bid, mid, announcement, created_at),
+                "INSERT INTO announcements(band_id,member_id,body,created_at,updated_at) VALUES(?,?,?,?,?)",
+                (bid, mid, announcement, created_at, created_at),
             ).lastrowid
             record_activity(conn, bid, mid, "posted an announcement", "announcement", announcement_id,
                             announcement[:120])
             conn.commit()
-            saved = conn.execute("""SELECT a.id,a.body,a.created_at,m.id AS member_id,m.display_name,m.color
+            saved = conn.execute("""SELECT a.id,a.body,a.created_at,a.updated_at,a.is_pinned,a.version,
+                    m.id AS member_id,m.display_name,m.color
                 FROM announcements a JOIN members m ON m.id=a.member_id
                 WHERE a.id=? AND a.band_id=?""", (announcement_id, bid)).fetchone()
             self.send_json(dict(saved), 201); return
+        announcement_match = re.fullmatch(r"/api/announcements/(\d+)", path)
+        if announcement_match:
+            announcement_id = int(announcement_match.group(1))
+            saved = conn.execute("""SELECT a.*,m.display_name,m.color FROM announcements a
+                JOIN members m ON m.id=a.member_id WHERE a.id=? AND a.band_id=?""",
+                (announcement_id, bid)).fetchone()
+            if not saved:
+                raise ApiError(404, "Announcement not found")
+            if method == "PATCH":
+                expected = body.get("version")
+                if expected is None:
+                    raise ApiError(400, "Announcement version is required to edit")
+                try:
+                    expected = int(expected)
+                except (TypeError, ValueError):
+                    raise ApiError(400, "Announcement version is invalid")
+                if expected != saved["version"]:
+                    raise ApiError(409, "This announcement changed since you opened it. Reload before saving.", dict(saved))
+                changes = []
+                values = []
+                if "body" in body:
+                    if saved["member_id"] != mid and member["role"] != "admin":
+                        raise ApiError(403, "You can edit only your own announcements")
+                    text = clean_text(body.get("body"), "Announcement", 2000, True)
+                    changes.append("body=?")
+                    values.append(text)
+                if "pinned" in body:
+                    require_admin(member)
+                    if not isinstance(body["pinned"], bool):
+                        raise ApiError(400, "Pinned must be true or false")
+                    changes.append("is_pinned=?")
+                    values.append(int(body["pinned"]))
+                if not changes:
+                    raise ApiError(400, "Make an announcement change before saving")
+                changed_at = now_iso()
+                changes.extend(["updated_at=?", "version=version+1"])
+                values.extend([changed_at, announcement_id, bid, expected])
+                updated = conn.execute(
+                    f"UPDATE announcements SET {','.join(changes)} WHERE id=? AND band_id=? AND version=?", values)
+                if updated.rowcount == 0:
+                    raise ApiError(409, "This announcement changed while you were saving it. Reload and try again.")
+                action = "updated an announcement" if "body" in body else ("pinned an announcement" if body["pinned"] else "unpinned an announcement")
+                record_activity(conn, bid, mid, action, "announcement", announcement_id,
+                                text[:120] if "body" in body else saved["body"][:120])
+                conn.commit()
+                latest = conn.execute("""SELECT a.id,a.body,a.created_at,a.updated_at,a.is_pinned,a.version,
+                        m.id AS member_id,m.display_name,m.color FROM announcements a JOIN members m ON m.id=a.member_id
+                    WHERE a.id=? AND a.band_id=?""", (announcement_id, bid)).fetchone()
+                self.send_json(dict(latest)); return
+            if method == "DELETE":
+                if saved["member_id"] != mid and member["role"] != "admin":
+                    raise ApiError(403, "You can delete only your own announcements")
+                if body.get("confirm") is not True:
+                    raise ApiError(400, "Confirm announcement deletion")
+                try:
+                    expected = int(body.get("version"))
+                except (TypeError, ValueError):
+                    raise ApiError(400, "Announcement version is required to delete")
+                if expected != saved["version"]:
+                    raise ApiError(409, "This announcement changed since you opened it. Reload before deleting.")
+                record_activity(conn, bid, mid, "deleted an announcement", "announcement", announcement_id,
+                                saved["body"][:120])
+                deleted = conn.execute("DELETE FROM announcements WHERE id=? AND band_id=? AND version=?",
+                                       (announcement_id, bid, expected))
+                if deleted.rowcount == 0:
+                    raise ApiError(409, "This announcement changed while you were deleting it. Reload before deleting.")
+                conn.commit()
+                self.send_json({"ok": True}); return
+            raise ApiError(405, "Method not allowed")
         if path == "/api/songs" and method == "GET":
             self.list_songs(conn, member, query); return
         if path == "/api/songs" and method == "POST":
@@ -1175,9 +1434,10 @@ class Handler(BaseHTTPRequestHandler):
             FROM songs s JOIN members m ON m.id=s.updated_by WHERE s.band_id=? AND s.status IN ('learning','practicing') ORDER BY s.priority DESC,s.updated_at DESC LIMIT 5""",(mid,bid))]
         updates=[dict(r) for r in conn.execute("""SELECT a.id,a.action,a.entity_type,a.entity_title,a.created_at,m.display_name,m.color FROM activity a
             JOIN members m ON m.id=a.member_id WHERE a.band_id=? ORDER BY a.created_at DESC,a.id DESC LIMIT 8""",(bid,))]
-        announcements=[dict(r) for r in conn.execute("""SELECT a.id,a.body,a.created_at,m.id AS member_id,m.display_name,m.color
+        announcements=[dict(r) for r in conn.execute("""SELECT a.id,a.body,a.created_at,a.updated_at,a.is_pinned,a.version,
+                m.id AS member_id,m.display_name,m.color
             FROM announcements a JOIN members m ON m.id=a.member_id WHERE a.band_id=?
-            ORDER BY a.created_at DESC,a.id DESC LIMIT 10""",(bid,))]
+            ORDER BY a.is_pinned DESC,a.created_at DESC,a.id DESC LIMIT 10""",(bid,))]
         self.send_json({"next_rehearsal":next_rehearsal,"planned_songs":songs,"needs_practice":practice,"recent_updates":updates,
                         "announcements":announcements,
                         "songs_count":conn.execute("SELECT COUNT(*) FROM songs WHERE band_id=? AND status!='archived'",(bid,)).fetchone()[0],
@@ -1368,6 +1628,8 @@ class Handler(BaseHTTPRequestHandler):
             if target in invited and response in ATTENDANCE:
                 conn.execute("UPDATE rehearsal_attendance SET response=? WHERE rehearsal_id=? AND member_id=?",(response,rid,target))
         recalculate_shares(conn,rid)
+        queue_rehearsal_invites(conn, member["band_id"], rid, invited, 1)
+        refresh_rehearsal_reminders(conn, member["band_id"], rid, invited, left.isoformat(), status, 1)
         record_activity(conn,member["band_id"],member["id"],"planned a rehearsal","rehearsal",rid,title);conn.commit();self.send_json(get_rehearsal(conn,rid,member["band_id"]),201)
 
     def set_attendance(self,conn,member,rid,target,body):
@@ -1376,7 +1638,13 @@ class Handler(BaseHTTPRequestHandler):
         exists=conn.execute("SELECT 1 FROM rehearsal_attendance WHERE rehearsal_id=? AND member_id=?",(rid,target)).fetchone()
         if not exists: raise ApiError(404,"Member is not invited to this rehearsal")
         conn.execute("UPDATE rehearsal_attendance SET response=? WHERE rehearsal_id=? AND member_id=?",(response,rid,target))
-        recalculate_shares(conn,rid);conn.execute("UPDATE rehearsals SET updated_by=?,updated_at=?,version=version+1 WHERE id=?",(target,now_iso(),rid));conn.commit();self.send_json(get_rehearsal(conn,rid,member["band_id"]))
+        recalculate_shares(conn,rid)
+        event = conn.execute("SELECT start_utc,status,version,invited_ids_json FROM rehearsals WHERE id=? AND band_id=?",(rid,member["band_id"])).fetchone()
+        if response == "no_response":
+            refresh_rehearsal_reminders(conn,member["band_id"],rid,parse_json_list(event["invited_ids_json"]),event["start_utc"],event["status"],event["version"]+1)
+        else:
+            conn.execute("UPDATE email_notifications SET status='cancelled',locked_at=NULL WHERE rehearsal_id=? AND member_id=? AND kind='reminder' AND status='pending'",(rid,target))
+        conn.execute("UPDATE rehearsals SET updated_by=?,updated_at=?,version=version+1 WHERE id=?",(target,now_iso(),rid));conn.commit();self.send_json(get_rehearsal(conn,rid,member["band_id"]))
 
     def update_rehearsal(self,conn,member,band,row,body):
         if body.get("version") is None: raise ApiError(400,"Rehearsal version is required to edit")
@@ -1422,11 +1690,37 @@ class Handler(BaseHTTPRequestHandler):
             total=row["total_cost_cad"]
             cost_override=row["cost_override"]
         old_invited=set(parse_json_list(row["invited_ids_json"]));new_invited=set(invited)
+        location_name=location["name"] if location else clean_text(data.get("location_name",row["location_name_snapshot"]),"Location name",120)
+        address=location["address"] if location else clean_text(data.get("address",row["address_snapshot"]),"Address",400)
+        room_number=clean_text(data.get("room_number",row["room_number"]),"Room number",80)
+        booking_link=safe_url(data.get("booking_link",row["booking_link"]),"Booking link")
+        booking_reference=clean_text(data.get("booking_reference",row["booking_reference"]),"Booking reference",120)
+        material_change=(title!=row["title"] or event_type!=row["event_type"] or status!=row["status"]
+            or left.isoformat()!=row["start_utc"] or right.isoformat()!=row["end_utc"]
+            or location_name!=row["location_name_snapshot"] or address!=row["address_snapshot"]
+            or room_number!=row["room_number"] or booking_link!=row["booking_link"]
+            or booking_reference!=row["booking_reference"])
         for mid in new_invited-old_invited:conn.execute("INSERT OR IGNORE INTO rehearsal_attendance(rehearsal_id,member_id,response) VALUES(?,?,?)",(row["id"],mid,"no_response"))
         for mid in old_invited-new_invited:conn.execute("DELETE FROM rehearsal_attendance WHERE rehearsal_id=? AND member_id=?",(row["id"],mid))
         updated=conn.execute("""UPDATE rehearsals SET title=?,event_type=?,start_utc=?,end_utc=?,status=?,invited_ids_json=?,location_id=?,location_name_snapshot=?,address_snapshot=?,room_number=?,booking_link=?,booking_reference=?,total_cost_cad=?,cost_override=?,hourly_rate_snapshot=?,flat_cost_snapshot=?,split_mode=?,split_member_ids_json=?,goals=?,notes=?,summary=?,updated_at=?,updated_by=?,version=version+1 WHERE id=? AND version=?""",
-            (title,event_type,left.isoformat(),right.isoformat(),status,json.dumps(invited),location_id,location["name"] if location else clean_text(data.get("location_name",row["location_name_snapshot"]),"Location name",120),location["address"] if location else clean_text(data.get("address",row["address_snapshot"]),"Address",400),clean_text(data.get("room_number",row["room_number"]),"Room number",80),safe_url(data.get("booking_link",row["booking_link"]),"Booking link"),clean_text(data.get("booking_reference",row["booking_reference"]),"Booking reference",120),total,cost_override,rate_snapshot_hour,rate_snapshot_flat,split_mode,json.dumps(split_ids),clean_text(data.get("goals",row["goals"]),"Rehearsal goals",3000),clean_text(data.get("notes",row["notes"]),"Rehearsal notes",5000),clean_text(data.get("summary",row["summary"]),"Rehearsal summary",5000),now_iso(),member["id"],row["id"],int(body["version"])))
+            (title,event_type,left.isoformat(),right.isoformat(),status,json.dumps(invited),location_id,location_name,address,room_number,booking_link,booking_reference,total,cost_override,rate_snapshot_hour,rate_snapshot_flat,split_mode,json.dumps(split_ids),clean_text(data.get("goals",row["goals"]),"Rehearsal goals",3000),clean_text(data.get("notes",row["notes"]),"Rehearsal notes",5000),clean_text(data.get("summary",row["summary"]),"Rehearsal summary",5000),now_iso(),member["id"],row["id"],int(body["version"])))
         if updated.rowcount==0:raise ApiError(409,"This rehearsal changed while you were editing it. Reload before saving.",get_rehearsal(conn,row["id"],member["band_id"]))
+        next_version=int(row["version"])+1
+        removed=old_invited-new_invited
+        if removed:
+            placeholders=",".join("?" for _ in removed)
+            conn.execute(f"UPDATE email_notifications SET status='cancelled',locked_at=NULL WHERE rehearsal_id=? AND status='pending' AND member_id IN ({placeholders})",(row["id"],*removed))
+        if material_change:
+            conn.execute("UPDATE email_notifications SET status='cancelled',locked_at=NULL WHERE rehearsal_id=? AND status='pending' AND kind IN ('invite','change','reminder')",(row["id"],))
+            if status in ("cancelled","completed"):
+                queue_rehearsal_invites(conn,member["band_id"],row["id"],invited,next_version,"change")
+            else:
+                queue_rehearsal_invites(conn,member["band_id"],row["id"],sorted(old_invited&new_invited),next_version,"change")
+                queue_rehearsal_invites(conn,member["band_id"],row["id"],sorted(new_invited-old_invited),next_version,"invite")
+        else:
+            queue_rehearsal_invites(conn,member["band_id"],row["id"],sorted(new_invited-old_invited),next_version)
+        if material_change or old_invited!=new_invited:
+            refresh_rehearsal_reminders(conn,member["band_id"],row["id"],invited,left.isoformat(),status,next_version)
         recalculate_shares(conn,row["id"]);record_activity(conn,member["band_id"],member["id"],"updated a rehearsal","rehearsal",row["id"],title);conn.commit();self.send_json(get_rehearsal(conn,row["id"],member["band_id"]))
 
     def add_rehearsal_song(self,conn,member,rid,body):
@@ -1470,6 +1764,7 @@ def main():
     init_db()
     print(f"Bandroom running at http://{HOST}:{PORT}")
     print(f"SQLite database: {DB_PATH}")
+    threading.Thread(target=email_worker, name="bandroom-email-worker", daemon=True).start()
     ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
 
 

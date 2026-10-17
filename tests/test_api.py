@@ -5,7 +5,7 @@ import unittest
 from datetime import date, timedelta
 from http.cookies import SimpleCookie
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import app
 
@@ -274,6 +274,96 @@ class ApiTests(unittest.TestCase):
             self.call(self.admin, "/api/announcements", "POST", body={"body": "x" * 2001})
         self.assertEqual(too_long.exception.status, 400)
 
+    def test_announcement_edit_delete_and_admin_pin_permissions(self):
+        status, created = self.call(self.member, "/api/announcements", "POST", body={"body": "Old announcement"})
+        self.assertEqual(status, 201)
+        other_member_id = self.add_member("Jordan", "jordan@example.test", "member")
+        with self.assertRaises(app.ApiError) as other_edit:
+            self.call(self.member_row(other_member_id), f"/api/announcements/{created['id']}", "PATCH",
+                      body={"body": "Not your post", "version": created["version"]})
+        self.assertEqual(other_edit.exception.status, 403)
+        status, edited = self.call(self.member, f"/api/announcements/{created['id']}", "PATCH",
+                                   body={"body": "Updated announcement", "version": created["version"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(edited["body"], "Updated announcement")
+        with self.assertRaises(app.ApiError) as stale:
+            self.call(self.member, f"/api/announcements/{created['id']}", "PATCH",
+                      body={"body": "Lost update", "version": created["version"]})
+        self.assertEqual(stale.exception.status, 409)
+        with self.assertRaises(app.ApiError) as member_pin:
+            self.call(self.member, f"/api/announcements/{created['id']}", "PATCH",
+                      body={"pinned": True, "version": edited["version"]})
+        self.assertEqual(member_pin.exception.status, 403)
+        status, pinned = self.call(self.admin, f"/api/announcements/{created['id']}", "PATCH",
+                                   body={"pinned": True, "version": edited["version"]})
+        self.assertEqual(status, 200)
+        self.assertTrue(pinned["is_pinned"])
+        status, deleted = self.call(self.member, f"/api/announcements/{created['id']}", "DELETE",
+                                    body={"confirm": True, "version": pinned["version"]})
+        self.assertEqual(status, 200)
+        self.assertTrue(deleted["ok"])
+
+    def test_rehearsal_queues_invites_and_day_before_non_responder_reminders(self):
+        day = (date.today() + timedelta(days=4)).isoformat()
+        status, rehearsal = self.call(self.admin, "/api/rehearsals", "POST", body={
+            "title": "Reminder test", "date": day, "start_time": "18:00", "end_time": "20:00",
+            "status": "confirmed", "invited_ids": [self.member_id]})
+        self.assertEqual(status, 201)
+        rows = self.conn.execute("SELECT * FROM email_notifications WHERE rehearsal_id=? ORDER BY kind",
+                                 (rehearsal["id"],)).fetchall()
+        self.assertEqual({row["kind"] for row in rows}, {"invite", "reminder"})
+        reminder = next(row for row in rows if row["kind"] == "reminder")
+        start = app.datetime.fromisoformat(rehearsal["start_utc"])
+        send_at = app.datetime.fromisoformat(reminder["send_at"])
+        self.assertEqual(start - send_at, timedelta(hours=24))
+
+        self.conn.execute("UPDATE email_notifications SET send_at=? WHERE id=?",
+                          (app.now_iso(), reminder["id"]))
+        self.conn.commit()
+        sent = []
+        with patch.object(app, "password_reset_email_config", return_value={"public_url":"https://bandroom.example.test"}), \
+                patch.object(app, "send_rehearsal_email", side_effect=lambda notification, settings: sent.append(notification["email"])):
+            self.assertTrue(app.process_email_notification(reminder["id"]))
+        self.assertEqual(sent, ["member@example.test"])
+        delivered = self.conn.execute("SELECT status FROM email_notifications WHERE id=?", (reminder["id"],)).fetchone()
+        self.assertEqual(delivered["status"], "sent")
+
+    def test_reminder_is_cancelled_when_member_responds(self):
+        day = (date.today() + timedelta(days=3)).isoformat()
+        status, rehearsal = self.call(self.admin, "/api/rehearsals", "POST", body={
+            "title": "RSVP reminder test", "date": day, "start_time": "18:00", "end_time": "20:00",
+            "status": "proposed", "invited_ids": [self.member_id]})
+        reminder = self.conn.execute("SELECT * FROM email_notifications WHERE rehearsal_id=? AND kind='reminder'",
+                                    (rehearsal["id"],)).fetchone()
+        self.conn.execute("UPDATE email_notifications SET send_at=? WHERE id=?", (app.now_iso(), reminder["id"]))
+        self.conn.commit()
+        self.call(self.member, f"/api/rehearsals/{rehearsal['id']}/response", "POST",
+                  body={"response":"attending"})
+        self.assertFalse(app.process_email_notification(reminder["id"]))
+        state = self.conn.execute("SELECT status FROM email_notifications WHERE id=?", (reminder["id"],)).fetchone()
+        self.assertEqual(state["status"], "cancelled")
+
+    def test_smtp_delivery_supports_starttls_and_implicit_tls(self):
+        message = MagicMock()
+        server = MagicMock()
+        server.__enter__.return_value = server
+        settings = {"host":"smtp.example.test", "username":"user", "password":"secret", "port":587}
+        with patch.object(app.smtplib, "SMTP", return_value=server) as starttls_server:
+            app.send_smtp_message(message, settings)
+        starttls_server.assert_called_once_with("smtp.example.test", 587, timeout=15)
+        server.starttls.assert_called_once()
+        server.login.assert_called_once_with("user", "secret")
+        server.send_message.assert_called_once_with(message)
+
+        ssl_server = MagicMock()
+        ssl_server.__enter__.return_value = ssl_server
+        settings["port"] = 465
+        with patch.object(app.smtplib, "SMTP_SSL", return_value=ssl_server) as implicit_tls_server:
+            app.send_smtp_message(message, settings)
+        self.assertEqual(implicit_tls_server.call_args.args[:2], ("smtp.example.test", 465))
+        ssl_server.login.assert_called_once_with("user", "secret")
+        ssl_server.send_message.assert_called_once_with(message)
+
     def test_song_create_edit_and_stale_edit_conflict(self):
         status,song=self.call(self.admin,"/api/songs","POST",body={"title":"Glass Harbour","artist":"The Lumen Lines","status":"learning","priority":4})
         self.assertEqual(status,201,song)
@@ -301,6 +391,9 @@ class ApiTests(unittest.TestCase):
         status,updated=self.call(self.member,f"/api/rehearsals/{rehearsal['id']}","PATCH",body={"version":rehearsal["version"],"title":"Tuesday rehearsal","date":day,"start_time":"18:30","end_time":"20:30","status":"confirmed"})
         self.assertEqual(status,200,updated)
         self.assertEqual(updated["title"],"Tuesday rehearsal")
+        changed_mail = self.conn.execute("SELECT member_id FROM email_notifications WHERE rehearsal_id=? AND kind='change' AND status='pending'",
+                                        (rehearsal["id"],)).fetchall()
+        self.assertEqual({row["member_id"] for row in changed_mail}, {self.admin_id, self.member_id})
         status,response=self.call(self.member,f"/api/rehearsals/{rehearsal['id']}/response","POST",body={"response":"attending"})
         self.assertEqual(status,200,response)
         self.assertEqual(sum(item["amount_cents"] for item in response["cost_shares"]),2501)

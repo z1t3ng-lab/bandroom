@@ -18,11 +18,13 @@ One Bandroom deployment can host multiple private band workspaces. Choose **Crea
 
 To sign in, enter the exact band name along with the member email and password. Accounts are band-specific; a person who belongs to two bands will have an account in each band.
 
-## Password reset email
+## Email delivery
 
 Sign-in includes a **Forgot your password?** link. The member enters their band name and account email. If they match an active account, Bandroom emails a one-time link that expires after 30 minutes. The member chooses a new password on the site. The link is stored as a hash, can only be used once, and resetting the password signs out that member's existing sessions.
 
-Password reset requires an SMTP email provider. Add these environment variables to the server (for example, in Render's service **Environment** settings):
+Rehearsal planning also uses email: invited members receive an invitation, members receive an update if key schedule details change, and invitees who have not responded get a reminder 24 hours before the rehearsal. If a rehearsal is created less than 24 hours ahead, the invitation is sent but no separate day-before reminder is queued. Reminder delivery uses a persistent database queue processed by the app's background worker. If the host pauses or restarts the web process, a due message may wait until that process runs again; use a host that keeps the worker running or a dedicated scheduled worker for time-critical delivery.
+
+Email delivery requires an SMTP email provider. Add these environment variables to the server (for example, in Render's service **Environment** settings):
 
 | Variable | Value |
 | --- | --- |
